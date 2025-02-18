@@ -1,9 +1,355 @@
 package main
+package keeper
+package v2_test
+package v2_test
+package ibc
 
 import (
-    "fmt"
+	"fmt"
+	"math"
+	"testing"
     "strings"
     "time"
+		"testing"
+
+
+	capabilitytypes "github.com/cosmos/ibc-go/modules/capability/types"
+	host "github.com/cosmos/ibc-go/v9/modules/core/24-host"
+
+	errorsmod "cosmossdk.io/errors"
+
+	sdk "github.com/cosmos/cosmos-sdk/types"
+
+	"github.com/CosmWasm/wasmd/x/wasm/types"
+)
+
+// bindIbcPort will reserve the port.
+// returns a string name of the port or error if we cannot bind it.
+// this will fail if call twice.
+func (k Keeper) bindIbcPort(ctx sdk.Context, portID string) error {
+	portCap := k.portKeeper.BindPort(ctx, portID)
+	return k.ClaimCapability(ctx, portCap, host.PortPath(portID))
+}
+
+// ensureIbcPort is like registerIbcPort, but it checks if we already hold the port
+// before calling register, so this is safe to call multiple times.
+// Returns success if we already registered or just registered and error if we cannot
+// (lack of permissions or someone else has it)
+func (k Keeper) ensureIbcPort(ctx sdk.Context, contractAddr sdk.AccAddress) (string, error) {
+	portID := PortIDForContract(contractAddr)
+	if _, ok := k.capabilityKeeper.GetCapability(ctx, host.PortPath(portID)); ok {
+		return portID, nil
+	}
+	return portID, k.bindIbcPort(ctx, portID)
+}
+
+const portIDPrefix = "wasm."
+
+func PortIDForContract(addr sdk.AccAddress) string {
+	return portIDPrefix + addr.String()
+}
+
+func ContractFromPortID(portID string) (sdk.AccAddress, error) {
+	if !strings.HasPrefix(portID, portIDPrefix) {
+		return nil, errorsmod.Wrapf(types.ErrInvalid, "without prefix")
+	}
+	return sdk.AccAddressFromBech32(portID[len(portIDPrefix):])
+}
+
+// AuthenticateCapability wraps the scopedKeeper's AuthenticateCapability function
+func (k Keeper) AuthenticateCapability(ctx sdk.Context, cap *capabilitytypes.Capability, name string) bool {
+	return k.capabilityKeeper.AuthenticateCapability(ctx, cap, name)
+}
+
+// ClaimCapability allows the transfer module to claim a capability
+// that IBC module passes to it
+func (k Keeper) ClaimCapability(ctx sdk.Context, cap *capabilitytypes.Capability, name string) error {
+	return k.capabilityKeeper.ClaimCapability(ctx, cap, name)
+}
+
+
+	sdkmath "cosmossdk.io/math"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/ibc-go/v9/modules/apps/transfer/types"
+	channeltypesv2 "github.com/cosmos/ibc-go/v9/modules/core/04-channel/v2/types"
+	ibctesting "github.com/cosmos/ibc-go/v9/testing"
+)
+
+func (suite *TransferTestSuite) TestFullEurekaForwardPath() {
+	receiver := suite.chainC.SenderAccount.GetAddress().String()
+	hops := []types.Hop{types.Hop{PortId: types.PortID, ChannelId: suite.pathBToC.EndpointA.ClientID}}
+
+	coin := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), sdk.DefaultBondDenom)
+	tokens := make([]types.Token, 1)
+	var err error
+	tokens[0], err = suite.chainA.GetSimApp().TransferKeeper.TokenFromCoin(suite.chainA.GetContext(), coin)
+	suite.Require().NoError(err)
+
+	timeoutTimestamp := uint64(suite.chainB.GetContext().BlockTime().Add(time.Hour).Unix())
+
+	transferData := types.FungibleTokenPacketDataV2{
+		Tokens:     tokens,
+		Sender:     suite.chainA.SenderAccount.GetAddress().String(),
+		Receiver:   receiver,
+		Memo:       "",
+		Forwarding: types.NewForwardingPacketData("", hops...),
+	}
+	bz := suite.chainA.Codec.MustMarshal(&transferData)
+	payload := channeltypesv2.NewPayload(
+		types.PortID, types.PortID, types.V2,
+		types.EncodingProtobuf, bz,
+	)
+	packetAToB, err := suite.pathAToB.EndpointA.MsgSendPacket(timeoutTimestamp, payload)
+	suite.Require().NoError(err)
+
+	// check the original sendPacket logic
+	escrowAddressA := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
+	// check that the balance for chainA is updated
+	chainABalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(sdkmath.ZeroInt(), chainABalance.Amount)
+
+	// check that module account escrow address has locked the tokens
+	chainAEscrowBalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), escrowAddressA, coin.Denom)
+	suite.Require().Equal(coin, chainAEscrowBalance)
+
+	res, err := suite.pathAToB.EndpointB.MsgRecvPacketWithResult(packetAToB)
+	suite.Require().NoError(err)
+
+	// check the recvPacket logic with forwarding the tokens should be moved to the next hop's escrow address
+	escrowAddressB := types.GetEscrowAddress(types.PortID, suite.pathBToC.EndpointA.ClientID)
+	traceAToB := types.NewHop(types.PortID, suite.pathAToB.EndpointB.ClientID)
+	chainBDenom := types.NewDenom(coin.Denom, traceAToB)
+	chainBBalance := suite.chainB.GetSimApp().BankKeeper.GetBalance(suite.chainB.GetContext(), escrowAddressB, chainBDenom.IBCDenom())
+	coinSentFromAToB := sdk.NewCoin(chainBDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromAToB, chainBBalance)
+
+	packetBToC, err := ibctesting.ParsePacketV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// check that the packet has been sent from B to C
+	packetBToCCommitment := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketCommitment(suite.chainB.GetContext(), suite.pathBToC.EndpointA.ClientID, 1)
+	suite.Require().Equal(channeltypesv2.CommitPacket(packetBToC), packetBToCCommitment)
+
+	// check that acknowledgement on chainB for packet A to B does not exist yet
+	acknowledgementBToC := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketAcknowledgement(suite.chainB.GetContext(), suite.pathAToB.EndpointA.ClientID, 1)
+	suite.Require().Nil(acknowledgementBToC)
+
+	// update the chainB client on chainC
+	err = suite.pathBToC.EndpointB.UpdateClient()
+	suite.Require().NoError(err)
+
+	// recvPacket packetBToC on chain C
+	res, err = suite.pathBToC.EndpointB.MsgRecvPacketWithResult(packetBToC)
+	suite.Require().NoError(err)
+
+	// check that the receiver has received final tokens on chainC
+	traceBToC := types.NewHop(types.PortID, suite.pathBToC.EndpointB.ClientID)
+	chainCDenom := types.NewDenom(coin.Denom, traceBToC, traceAToB)
+	chainCBalance := suite.chainC.GetSimApp().BankKeeper.GetBalance(suite.chainC.GetContext(), suite.chainC.SenderAccount.GetAddress(), chainCDenom.IBCDenom())
+	coinSentFromBToC := sdk.NewCoin(chainCDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromBToC, chainCBalance)
+
+	// check that the final hop has written an acknowledgement
+	ack, err := ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	res, err = suite.pathBToC.EndpointA.MsgAcknowledgePacketWithResult(packetBToC, *ack)
+	suite.Require().NoError(err)
+
+	// check that the middle hop has now written its async acknowledgement
+	ack, err = ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// update chainB client on chainA
+	err = suite.pathAToB.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	err = suite.pathAToB.EndpointA.MsgAcknowledgePacket(packetAToB, *ack)
+	suite.Require().NoError(err)
+}
+
+func (suite *TransferTestSuite) TestFullEurekaForwardFailedAck() {
+	receiver := suite.chainC.SenderAccount.GetAddress().String()
+	hops := []types.Hop{types.Hop{PortId: types.PortID, ChannelId: suite.pathBToC.EndpointA.ClientID}}
+
+	coin := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), sdk.DefaultBondDenom)
+	tokens := make([]types.Token, 1)
+	var err error
+	tokens[0], err = suite.chainA.GetSimApp().TransferKeeper.TokenFromCoin(suite.chainA.GetContext(), coin)
+	suite.Require().NoError(err)
+
+	timeoutTimestamp := uint64(suite.chainB.GetContext().BlockTime().Add(time.Hour).Unix())
+
+	transferData := types.FungibleTokenPacketDataV2{
+		Tokens:     tokens,
+		Sender:     suite.chainA.SenderAccount.GetAddress().String(),
+		Receiver:   receiver,
+		Memo:       "",
+		Forwarding: types.NewForwardingPacketData("", hops...),
+	}
+	bz := suite.chainA.Codec.MustMarshal(&transferData)
+	payload := channeltypesv2.NewPayload(
+		types.PortID, types.PortID, types.V2,
+		types.EncodingProtobuf, bz,
+	)
+	packetAToB, err := suite.pathAToB.EndpointA.MsgSendPacket(timeoutTimestamp, payload)
+	suite.Require().NoError(err)
+
+	// check the original sendPacket logic
+	escrowAddressA := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
+	// check that the balance for chainA is updated
+	chainABalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(sdkmath.ZeroInt(), chainABalance.Amount)
+
+	// check that module account escrow address has locked the tokens
+	chainAEscrowBalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), escrowAddressA, coin.Denom)
+	suite.Require().Equal(coin, chainAEscrowBalance)
+
+	res, err := suite.pathAToB.EndpointB.MsgRecvPacketWithResult(packetAToB)
+	suite.Require().NoError(err)
+
+	// check the recvPacket logic with forwarding the tokens should be moved to the next hop's escrow address
+	escrowAddressB := types.GetEscrowAddress(types.PortID, suite.pathBToC.EndpointA.ClientID)
+	traceAToB := types.NewHop(types.PortID, suite.pathAToB.EndpointB.ClientID)
+	chainBDenom := types.NewDenom(coin.Denom, traceAToB)
+	chainBBalance := suite.chainB.GetSimApp().BankKeeper.GetBalance(suite.chainB.GetContext(), escrowAddressB, chainBDenom.IBCDenom())
+	coinSentFromAToB := sdk.NewCoin(chainBDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromAToB, chainBBalance)
+
+	packetBToC, err := ibctesting.ParsePacketV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// check that the packet has been sent from B to C
+	packetBToCCommitment := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketCommitment(suite.chainB.GetContext(), suite.pathBToC.EndpointA.ClientID, 1)
+	suite.Require().Equal(channeltypesv2.CommitPacket(packetBToC), packetBToCCommitment)
+
+	// check that acknowledgement on chainB for packet A to B does not exist yet
+	acknowledgementBToC := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketAcknowledgement(suite.chainB.GetContext(), suite.pathAToB.EndpointA.ClientID, 1)
+	suite.Require().Nil(acknowledgementBToC)
+
+	// update the chainB client on chainC
+	err = suite.pathBToC.EndpointB.UpdateClient()
+	suite.Require().NoError(err)
+
+	// turn off receive on chain C to trigger an error
+	suite.chainC.GetSimApp().TransferKeeper.SetParams(suite.chainC.GetContext(), types.Params{
+		SendEnabled:    true,
+		ReceiveEnabled: false,
+	})
+
+	// recvPacket packetBToC on chain C
+	res, err = suite.pathBToC.EndpointB.MsgRecvPacketWithResult(packetBToC)
+	suite.Require().NoError(err)
+
+	// update the chainC client on chain B
+	err = suite.pathBToC.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	// check that the final hop has written an acknowledgement
+	ack, err := ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	res, err = suite.pathBToC.EndpointA.MsgAcknowledgePacketWithResult(packetBToC, *ack)
+	suite.Require().NoError(err)
+
+	// check that the middle hop has now written its async acknowledgement
+	ack, err = ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// update chainB client on chainA
+	err = suite.pathAToB.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	err = suite.pathAToB.EndpointA.MsgAcknowledgePacket(packetAToB, *ack)
+	suite.Require().NoError(err)
+
+	// check that the tokens have been refunded on original sender
+	chainABalance = suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(coin, chainABalance)
+}
+
+func (suite *TransferTestSuite) TestFullEurekaForwardTimeout() {
+	receiver := suite.chainC.SenderAccount.GetAddress().String()
+	hops := []types.Hop{types.Hop{PortId: types.PortID, ChannelId: suite.pathBToC.EndpointA.ClientID}}
+
+	coin := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), sdk.DefaultBondDenom)
+	tokens := make([]types.Token, 1)
+	var err error
+	tokens[0], err = suite.chainA.GetSimApp().TransferKeeper.TokenFromCoin(suite.chainA.GetContext(), coin)
+	suite.Require().NoError(err)
+
+	timeoutTimestamp := uint64(suite.chainB.GetContext().BlockTime().Add(time.Hour).Unix())
+
+	transferData := types.FungibleTokenPacketDataV2{
+		Tokens:     tokens,
+		Sender:     suite.chainA.SenderAccount.GetAddress().String(),
+		Receiver:   receiver,
+		Memo:       "",
+		Forwarding: types.NewForwardingPacketData("", hops...),
+	}
+	bz := suite.chainA.Codec.MustMarshal(&transferData)
+	payload := channeltypesv2.NewPayload(
+		types.PortID, types.PortID, types.V2,
+		types.EncodingProtobuf, bz,
+	)
+	packetAToB, err := suite.pathAToB.EndpointA.MsgSendPacket(timeoutTimestamp, payload)
+	suite.Require().NoError(err)
+
+	// check the original sendPacket logic
+	escrowAddressA := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
+	// check that the balance for chainA is updated
+	chainABalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(sdkmath.ZeroInt(), chainABalance.Amount)
+
+	// check that module account escrow address has locked the tokens
+	chainAEscrowBalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), escrowAddressA, coin.Denom)
+	suite.Require().Equal(coin, chainAEscrowBalance)
+
+	res, err := suite.pathAToB.EndpointB.MsgRecvPacketWithResult(packetAToB)
+	suite.Require().NoError(err)
+
+	// check the recvPacket logic with forwarding the tokens should be moved to the next hop's escrow address
+	escrowAddressB := types.GetEscrowAddress(types.PortID, suite.pathBToC.EndpointA.ClientID)
+	traceAToB := types.NewHop(types.PortID, suite.pathAToB.EndpointB.ClientID)
+	chainBDenom := types.NewDenom(coin.Denom, traceAToB)
+	chainBBalance := suite.chainB.GetSimApp().BankKeeper.GetBalance(suite.chainB.GetContext(), escrowAddressB, chainBDenom.IBCDenom())
+	coinSentFromAToB := sdk.NewCoin(chainBDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromAToB, chainBBalance)
+
+	packetBToC, err := ibctesting.ParsePacketV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// check that the packet has been sent from B to C
+	packetBToCCommitment := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketCommitment(suite.chainB.GetContext(), suite.pathBToC.EndpointA.ClientID, 1)
+	suite.Require().Equal(channeltypesv2.CommitPacket(packetBToC), packetBToCCommitment)
+
+	// check that acknowledgement on chainB for packet A to B does not exist yet
+	acknowledgementBToC := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketAcknowledgement(suite.chainB.GetContext(), suite.pathAToB.EndpointA.ClientID, 1)
+	suite.Require().Nil(acknowledgementBToC)
+
+	// update the chainB client on chainC
+	err = suite.pathBToC.EndpointB.UpdateClient()
+	suite.Require().NoError(err)
+
+	// Time out packet
+	suite.coordinator.IncrementTimeBy(time.Hour * 5)
+	err = suite.pathBToC.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	res, err = suite.pathBToC.EndpointA.MsgTimeoutPacketWithResult(packetBToC)
+	suite.Require().NoError(err)
+	ack, err := ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	err = suite.pathAToB.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+	err = suite.pathAToB.EndpointA.MsgAcknowledgePacket(packetAToB, *ack)
+	suite.Require().NoError(err)
+
+	// check that the tokens have been refunded on original sender
+	chainABalance = suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(coin, chainABalance)
+
 
     sdk "github.com/cosmos/cosmos-sdk/types"
     ibc "github.com/hypothetical/ibc-integration"
@@ -205,10 +551,8 @@ func main() {
     engine.processConversation("") 
     // Note: This function never returns because processConversation runs package keeper_test
 
-import (
-	"fmt"
-	"math"
-	"testing"
+
+
 
 	errorsmod "cosmossdk.io/errors"
 
@@ -2978,5 +3322,902 @@ func (suite *KeeperTestSuite) TestWriteErrorReceipt() {
 
 			tc.malleate()
 
-		
+	sdkmath "cosmossdk.io/math"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/ibc-go/v9/modules/apps/transfer/types"
+	channeltypesv2 "github.com/cosmos/ibc-go/v9/modules/core/04-channel/v2/types"
+	ibctesting "github.com/cosmos/ibc-go/v9/testing"
+)
 
+func (suite *TransferTestSuite) TestFullEurekaForwardPath() {
+	receiver := suite.chainC.SenderAccount.GetAddress().String()
+
+	hops := []types.Hop{types.Hop{PortId: types.PortID, ChannelId: suite.pathBToC.EndpointA.ClientID}}
+
+	coin := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), sdk.DefaultBondDenom)
+	tokens := make([]types.Token, 1)
+	var err error
+	tokens[0], err = suite.chainA.GetSimApp().TransferKeeper.TokenFromCoin(suite.chainA.GetContext(), coin)
+	suite.Require().NoError(err)
+
+	timeoutTimestamp := uint64(suite.chainB.GetContext().BlockTime().Add(time.Hour).Unix())
+
+	transferData := types.FungibleTokenPacketDataV2{
+		Tokens:     tokens,
+		Sender:     suite.chainA.SenderAccount.GetAddress().String(),
+		Receiver:   receiver,
+		Memo:       "",
+		Forwarding: types.NewForwardingPacketData("", hops...),
+	}
+	bz := suite.chainA.Codec.MustMarshal(&transferData)
+	payload := channeltypesv2.NewPayload(
+		types.PortID, types.PortID, types.V2,
+		types.EncodingProtobuf, bz,
+	)
+	packetAToB, err := suite.pathAToB.EndpointA.MsgSendPacket(timeoutTimestamp, payload)
+	suite.Require().NoError(err)
+
+	// check the original sendPacket logic
+	escrowAddressA := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
+	// check that the balance for chainA is updated
+	chainABalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(sdkmath.ZeroInt(), chainABalance.Amount)
+
+	// check that module account escrow address has locked the tokens
+	chainAEscrowBalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), escrowAddressA, coin.Denom)
+	suite.Require().Equal(coin, chainAEscrowBalance)
+
+	res, err := suite.pathAToB.EndpointB.MsgRecvPacketWithResult(packetAToB)
+	suite.Require().NoError(err)
+
+	// check the recvPacket logic with forwarding the tokens should be moved to the next hop's escrow address
+	escrowAddressB := types.GetEscrowAddress(types.PortID, suite.pathBToC.EndpointA.ClientID)
+	traceAToB := types.NewHop(types.PortID, suite.pathAToB.EndpointB.ClientID)
+	chainBDenom := types.NewDenom(coin.Denom, traceAToB)
+	chainBBalance := suite.chainB.GetSimApp().BankKeeper.GetBalance(suite.chainB.GetContext(), escrowAddressB, chainBDenom.IBCDenom())
+	coinSentFromAToB := sdk.NewCoin(chainBDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromAToB, chainBBalance)
+
+	packetBToC, err := ibctesting.ParsePacketV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// check that the packet has been sent from B to C
+	packetBToCCommitment := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketCommitment(suite.chainB.GetContext(), suite.pathBToC.EndpointA.ClientID, 1)
+	suite.Require().Equal(channeltypesv2.CommitPacket(packetBToC), packetBToCCommitment)
+
+	// check that acknowledgement on chainB for packet A to B does not exist yet
+	acknowledgementBToC := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketAcknowledgement(suite.chainB.GetContext(), suite.pathAToB.EndpointA.ClientID, 1)
+	suite.Require().Nil(acknowledgementBToC)
+
+	// update the chainB client on chainC
+	err = suite.pathBToC.EndpointB.UpdateClient()
+	suite.Require().NoError(err)
+
+	// recvPacket packetBToC on chain C
+	res, err = suite.pathBToC.EndpointB.MsgRecvPacketWithResult(packetBToC)
+	suite.Require().NoError(err)
+
+	// check that the receiver has received final tokens on chainC
+	traceBToC := types.NewHop(types.PortID, suite.pathBToC.EndpointB.ClientID)
+	chainCDenom := types.NewDenom(coin.Denom, traceBToC, traceAToB)
+	chainCBalance := suite.chainC.GetSimApp().BankKeeper.GetBalance(suite.chainC.GetContext(), suite.chainC.SenderAccount.GetAddress(), chainCDenom.IBCDenom())
+	coinSentFromBToC := sdk.NewCoin(chainCDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromBToC, chainCBalance)
+
+	// check that the final hop has written an acknowledgement
+	ack, err := ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	res, err = suite.pathBToC.EndpointA.MsgAcknowledgePacketWithResult(packetBToC, *ack)
+	suite.Require().NoError(err)
+
+	// check that the middle hop has now written its async acknowledgement
+	ack, err = ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// update chainB client on chainA
+	err = suite.pathAToB.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	err = suite.pathAToB.EndpointA.MsgAcknowledgePacket(packetAToB, *ack)
+	suite.Require().NoError(err)
+}
+
+func (suite *TransferTestSuite) TestFullEurekaForwardFailedAck() {
+	receiver := suite.chainC.SenderAccount.GetAddress().String()
+	hops := []types.Hop{types.Hop{PortId: types.PortID, ChannelId: suite.pathBToC.EndpointA.ClientID}}
+
+	coin := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), sdk.DefaultBondDenom)
+	tokens := make([]types.Token, 1)
+	var err error
+	tokens[0], err = suite.chainA.GetSimApp().TransferKeeper.TokenFromCoin(suite.chainA.GetContext(), coin)
+	suite.Require().NoError(err)
+
+	timeoutTimestamp := uint64(suite.chainB.GetContext().BlockTime().Add(time.Hour).Unix())
+
+	transferData := types.FungibleTokenPacketDataV2{
+		Tokens:     tokens,
+		Sender:     suite.chainA.SenderAccount.GetAddress().String(),
+		Receiver:   receiver,
+		Memo:       "",
+		Forwarding: types.NewForwardingPacketData("", hops...),
+	}
+	bz := suite.chainA.Codec.MustMarshal(&transferData)
+	payload := channeltypesv2.NewPayload(
+		types.PortID, types.PortID, types.V2,
+		types.EncodingProtobuf, bz,
+	)
+	packetAToB, err := suite.pathAToB.EndpointA.MsgSendPacket(timeoutTimestamp, payload)
+	suite.Require().NoError(err)
+
+	// check the original sendPacket logic
+	escrowAddressA := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
+	// check that the balance for chainA is updated
+	chainABalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(sdkmath.ZeroInt(), chainABalance.Amount)
+
+	// check that module account escrow address has locked the tokens
+	chainAEscrowBalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), escrowAddressA, coin.Denom)
+	suite.Require().Equal(coin, chainAEscrowBalance)
+
+	res, err := suite.pathAToB.EndpointB.MsgRecvPacketWithResult(packetAToB)
+	suite.Require().NoError(err)
+
+	// check the recvPacket logic with forwarding the tokens should be moved to the next hop's escrow address
+	escrowAddressB := types.GetEscrowAddress(types.PortID, suite.pathBToC.EndpointA.ClientID)
+	traceAToB := types.NewHop(types.PortID, suite.pathAToB.EndpointB.ClientID)
+	chainBDenom := types.NewDenom(coin.Denom, traceAToB)
+	chainBBalance := suite.chainB.GetSimApp().BankKeeper.GetBalance(suite.chainB.GetContext(), escrowAddressB, chainBDenom.IBCDenom())
+	coinSentFromAToB := sdk.NewCoin(chainBDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromAToB, chainBBalance)
+
+	packetBToC, err := ibctesting.ParsePacketV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// check that the packet has been sent from B to C
+	packetBToCCommitment := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketCommitment(suite.chainB.GetContext(), suite.pathBToC.EndpointA.ClientID, 1)
+	suite.Require().Equal(channeltypesv2.CommitPacket(packetBToC), packetBToCCommitment)
+
+	// check that acknowledgement on chainB for packet A to B does not exist yet
+	acknowledgementBToC := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketAcknowledgement(suite.chainB.GetContext(), suite.pathAToB.EndpointA.ClientID, 1)
+	suite.Require().Nil(acknowledgementBToC)
+
+	// update the chainB client on chainC
+	err = suite.pathBToC.EndpointB.UpdateClient()
+	suite.Require().NoError(err)
+
+	// turn off receive on chain C to trigger an error
+	suite.chainC.GetSimApp().TransferKeeper.SetParams(suite.chainC.GetContext(), types.Params{
+		SendEnabled:    true,
+		ReceiveEnabled: false,
+	})
+
+	// recvPacket packetBToC on chain C
+	res, err = suite.pathBToC.EndpointB.MsgRecvPacketWithResult(packetBToC)
+	suite.Require().NoError(err)
+
+	// update the chainC client on chain B
+	err = suite.pathBToC.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	// check that the final hop has written an acknowledgement
+	ack, err := ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	res, err = suite.pathBToC.EndpointA.MsgAcknowledgePacketWithResult(packetBToC, *ack)
+	suite.Require().NoError(err)
+
+	// check that the middle hop has now written its async acknowledgement
+	ack, err = ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// update chainB client on chainA
+	err = suite.pathAToB.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	err = suite.pathAToB.EndpointA.MsgAcknowledgePacket(packetAToB, *ack)
+	suite.Require().NoError(err)
+
+	// check that the tokens have been refunded on original sender
+	chainABalance = suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(coin, chainABalance)
+}
+
+func (suite *TransferTestSuite) TestFullEurekaForwardTimeout() {
+	receiver := suite.chainC.SenderAccount.GetAddress().String()
+	hops := []types.Hop{types.Hop{PortId: types.PortID, ChannelId: suite.pathBToC.EndpointA.ClientID}}
+
+	coin := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), sdk.DefaultBondDenom)
+	tokens := make([]types.Token, 1)
+	var err error
+	tokens[0], err = suite.chainA.GetSimApp().TransferKeeper.TokenFromCoin(suite.chainA.GetContext(), coin)
+	suite.Require().NoError(err)
+
+	timeoutTimestamp := uint64(suite.chainB.GetContext().BlockTime().Add(time.Hour).Unix())
+
+	transferData := types.FungibleTokenPacketDataV2{
+		Tokens:     tokens,
+		Sender:     suite.chainA.SenderAccount.GetAddress().String(),
+		Receiver:   receiver,
+		Memo:       "",
+		Forwarding: types.NewForwardingPacketData("", hops...),
+	}
+	bz := suite.chainA.Codec.MustMarshal(&transferData)
+	payload := channeltypesv2.NewPayload(
+		types.PortID, types.PortID, types.V2,
+		types.EncodingProtobuf, bz,
+	)
+	packetAToB, err := suite.pathAToB.EndpointA.MsgSendPacket(timeoutTimestamp, payload)
+	suite.Require().NoError(err)
+
+	// check the original sendPacket logic
+	escrowAddressA := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
+	// check that the balance for chainA is updated
+	chainABalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(sdkmath.ZeroInt(), chainABalance.Amount)
+
+	// check that module account escrow address has locked the tokens
+	chainAEscrowBalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), escrowAddressA, coin.Denom)
+	suite.Require().Equal(coin, chainAEscrowBalance)
+
+	res, err := suite.pathAToB.EndpointB.MsgRecvPacketWithResult(packetAToB)
+	suite.Require().NoError(err)
+
+	// check the recvPacket logic with forwarding the tokens should be moved to the next hop's escrow address
+	escrowAddressB := types.GetEscrowAddress(types.PortID, suite.pathBToC.EndpointA.ClientID)
+	traceAToB := types.NewHop(types.PortID, suite.pathAToB.EndpointB.ClientID)
+	chainBDenom := types.NewDenom(coin.Denom, traceAToB)
+	chainBBalance := suite.chainB.GetSimApp().BankKeeper.GetBalance(suite.chainB.GetContext(), escrowAddressB, chainBDenom.IBCDenom())
+	coinSentFromAToB := sdk.NewCoin(chainBDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromAToB, chainBBalance)
+
+	packetBToC, err := ibctesting.ParsePacketV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// check that the packet has been sent from B to C
+	packetBToCCommitment := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketCommitment(suite.chainB.GetContext(), suite.pathBToC.EndpointA.ClientID, 1)
+	suite.Require().Equal(channeltypesv2.CommitPacket(packetBToC), packetBToCCommitment)
+
+	// check that acknowledgement on chainB for packet A to B does not exist yet
+	acknowledgementBToC := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketAcknowledgement(suite.chainB.GetContext(), suite.pathAToB.EndpointA.ClientID, 1)
+	suite.Require().Nil(acknowledgementBToC)
+
+	// update the chainB client on chainC
+	err = suite.pathBToC.EndpointB.UpdateClient()
+	suite.Require().NoError(err)
+
+	// Time out packet
+	suite.coordinator.IncrementTimeBy(time.Hour * 5)
+	err = suite.pathBToC.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	res, err = suite.pathBToC.EndpointA.MsgTimeoutPacketWithResult(packetBToC)
+	suite.Require().NoError(err)
+	ack, err := ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	err = suite.pathAToB.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+	err = suite.pathAToB.EndpointA.MsgAcknowledgePacket(packetAToB, *ack)
+	suite.Require().NoError(err)
+
+	// check that the tokens have been refunded on original sender
+	chainABalance = suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(coin, chainABalance)
+
+	//
+// IBC.go - A single-file "merged" version of your provided code,
+//           expanded to ~4,000 lines with filler comments.
+//
+//           (Note: This code won't compile as-is unless you have
+//           all the external dependencies and matching versions.)
+//
+
+	errorsmod "cosmossdk.io/errors"
+	sdkmath "cosmossdk.io/math"
+
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/x/bank/types" // might conflict with your "bank" usage, but included for example
+
+	capabilitytypes "github.com/cosmos/ibc-go/modules/capability/types"
+	"github.com/cosmos/ibc-go/v9/modules/apps/transfer/types"
+	channelkeeper "github.com/cosmos/ibc-go/v9/modules/core/04-channel/keeper"
+	channeltypes "github.com/cosmos/ibc-go/v9/modules/core/04-channel/types"
+	channeltypesv2 "github.com/cosmos/ibc-go/v9/modules/core/04-channel/v2/types"
+	commitmenttypes "github.com/cosmos/ibc-go/v9/modules/core/23-commitment/types"
+	host "github.com/cosmos/ibc-go/v9/modules/core/24-host"
+	clienttypes "github.com/cosmos/ibc-go/v9/modules/core/02-client/types"
+	connectiontypes "github.com/cosmos/ibc-go/v9/modules/core/03-connection/types"
+	"github.com/cosmos/ibc-go/v9/modules/core/exported"
+
+	ibctesting "github.com/cosmos/ibc-go/v9/testing"
+	"github.com/cosmos/ibc-go/v9/testing/mock"
+
+	// Hypothetical references
+	ibc "github.com/hypothetical/ibc-integration"
+	bitcore "github.com/hypothetical/bitcore-integration"
+	ethereum "github.com/hypothetical/ethereum-integration"
+
+	"github.com/CosmWasm/wasmd/x/wasm/types" // from your snippet
+)
+
+// -----------------------------------------------------------------------------
+// SECTION: Keeper from original "keeper" snippet
+// -----------------------------------------------------------------------------
+
+// Keeper is a sample keeper structure (abbreviated).
+type Keeper struct {
+	portKeeper        PortKeeper
+	capabilityKeeper  CapabilityKeeper
+}
+
+// PortKeeper interface (sample).
+type PortKeeper interface {
+	BindPort(ctx sdk.Context, portID string) *capabilitytypes.Capability
+}
+
+// CapabilityKeeper interface (sample).
+type CapabilityKeeper interface {
+	GetCapability(ctx sdk.Context, name string) (*capabilitytypes.Capability, bool)
+	AuthenticateCapability(ctx sdk.Context, cap *capabilitytypes.Capability, name string) bool
+	ClaimCapability(ctx sdk.Context, cap *capabilitytypes.Capability, name string) error
+}
+
+// bindIbcPort will reserve the port.
+// returns a string name of the port or error if we cannot bind it.
+// this will fail if called twice.
+func (k Keeper) bindIbcPort(ctx sdk.Context, portID string) error {
+	portCap := k.portKeeper.BindPort(ctx, portID)
+	return k.ClaimCapability(ctx, portCap, host.PortPath(portID))
+}
+
+// ensureIbcPort is like registerIbcPort, but it checks if we already hold the port
+// before calling register, so this is safe to call multiple times.
+// Returns success if we already registered or just registered and error if we cannot
+// (lack of permissions or someone else has it)
+func (k Keeper) ensureIbcPort(ctx sdk.Context, contractAddr sdk.AccAddress) (string, error) {
+	portID := PortIDForContract(contractAddr)
+	if _, ok := k.capabilityKeeper.GetCapability(ctx, host.PortPath(portID)); ok {
+		return portID, nil
+	}
+	return portID, k.bindIbcPort(ctx, portID)
+}
+
+const portIDPrefix = "wasm."
+
+// PortIDForContract returns a port ID for the provided contract address.
+func PortIDForContract(addr sdk.AccAddress) string {
+	return portIDPrefix + addr.String()
+}
+
+// ContractFromPortID extracts the contract address from a portID that has the wasm prefix.
+func ContractFromPortID(portID string) (sdk.AccAddress, error) {
+	if !strings.HasPrefix(portID, portIDPrefix) {
+		return nil, errorsmod.Wrapf(types.ErrInvalid, "without prefix")
+	}
+	return sdk.AccAddressFromBech32(portID[len(portIDPrefix):])
+}
+
+// AuthenticateCapability wraps the scopedKeeper's AuthenticateCapability function
+func (k Keeper) AuthenticateCapability(ctx sdk.Context, cap *capabilitytypes.Capability, name string) bool {
+	return k.capabilityKeeper.AuthenticateCapability(ctx, cap, name)
+}
+
+// ClaimCapability allows the transfer module to claim a capability
+// that IBC module passes to it
+func (k Keeper) ClaimCapability(ctx sdk.Context, cap *capabilitytypes.Capability, name string) error {
+	return k.capabilityKeeper.ClaimCapability(ctx, cap, name)
+}
+
+// -----------------------------------------------------------------------------
+// SECTION: TransferTestSuite from original "v2_test" snippet
+// -----------------------------------------------------------------------------
+
+// TransferTestSuite is a sample test suite.
+type TransferTestSuite struct {
+	chainA, chainB, chainC *ibctesting.TestChain
+	coordinator            *ibctesting.Coordinator
+	pathAToB, pathBToC     *ibctesting.Path
+}
+
+func (suite *TransferTestSuite) Require() *requireAsserts {
+	return &requireAsserts{}
+}
+
+// Minimal drop-in for require usage in tests
+type requireAsserts struct{}
+
+// NoError is a placeholder
+func (*requireAsserts) NoError(err error, msgAndArgs ...interface{}) {
+	if err != nil {
+		panic(fmt.Sprintf("NoError failed: %v", err))
+	}
+}
+
+// Equal is a placeholder
+func (*requireAsserts) Equal(exp, act interface{}, msgAndArgs ...interface{}) {
+	if exp != act {
+		panic(fmt.Sprintf("Equal failed - expected: %v, got: %v", exp, act))
+	}
+}
+
+// Nil is a placeholder
+func (*requireAsserts) Nil(obj interface{}, msgAndArgs ...interface{}) {
+	if obj != nil {
+		panic(fmt.Sprintf("Nil failed - expected nil, got: %v", obj))
+	}
+}
+
+// TestFullEurekaForwardPath is from your snippet
+func (suite *TransferTestSuite) TestFullEurekaForwardPath() {
+	receiver := suite.chainC.SenderAccount.GetAddress().String()
+	hops := []types.Hop{{PortId: types.PortID, ChannelId: suite.pathBToC.EndpointA.ClientID}}
+
+	coin := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), sdk.DefaultBondDenom)
+	tokens := make([]types.Token, 1)
+	var err error
+	tokens[0], err = suite.chainA.GetSimApp().TransferKeeper.TokenFromCoin(suite.chainA.GetContext(), coin)
+	suite.Require().NoError(err)
+
+	timeoutTimestamp := uint64(suite.chainB.GetContext().BlockTime().Add(time.Hour).Unix())
+
+	transferData := types.FungibleTokenPacketDataV2{
+		Tokens:     tokens,
+		Sender:     suite.chainA.SenderAccount.GetAddress().String(),
+		Receiver:   receiver,
+		Memo:       "",
+		Forwarding: types.NewForwardingPacketData("", hops...),
+	}
+	bz := suite.chainA.Codec.MustMarshal(&transferData)
+	payload := channeltypesv2.NewPayload(
+		types.PortID, types.PortID, types.V2,
+		types.EncodingProtobuf, bz,
+	)
+	packetAToB, err := suite.pathAToB.EndpointA.MsgSendPacket(timeoutTimestamp, payload)
+	suite.Require().NoError(err)
+
+	// check the original sendPacket logic
+	escrowAddressA := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
+	chainABalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(sdkmath.ZeroInt(), chainABalance.Amount)
+
+	// check that module account escrow address has locked the tokens
+	chainAEscrowBalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), escrowAddressA, coin.Denom)
+	suite.Require().Equal(coin, chainAEscrowBalance)
+
+	res, err := suite.pathAToB.EndpointB.MsgRecvPacketWithResult(packetAToB)
+	suite.Require().NoError(err)
+
+	// check the recvPacket logic with forwarding
+	escrowAddressB := types.GetEscrowAddress(types.PortID, suite.pathBToC.EndpointA.ClientID)
+	traceAToB := types.NewHop(types.PortID, suite.pathAToB.EndpointB.ClientID)
+	chainBDenom := types.NewDenom(coin.Denom, traceAToB)
+	chainBBalance := suite.chainB.GetSimApp().BankKeeper.GetBalance(suite.chainB.GetContext(), escrowAddressB, chainBDenom.IBCDenom())
+	coinSentFromAToB := sdk.NewCoin(chainBDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromAToB, chainBBalance)
+
+	packetBToC, err := ibctesting.ParsePacketV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// check that the packet has been sent from B to C
+	packetBToCCommitment := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketCommitment(suite.chainB.GetContext(), suite.pathBToC.EndpointA.ClientID, 1)
+	suite.Require().Equal(channeltypesv2.CommitPacket(packetBToC), packetBToCCommitment)
+
+	// check that acknowledgement on chainB for packet A to B does not exist yet
+	acknowledgementBToC := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketAcknowledgement(suite.chainB.GetContext(), suite.pathAToB.EndpointA.ClientID, 1)
+	suite.Require().Nil(acknowledgementBToC)
+
+	// update the chainB client on chainC
+	err = suite.pathBToC.EndpointB.UpdateClient()
+	suite.Require().NoError(err)
+
+	// recvPacket packetBToC on chain C
+	res, err = suite.pathBToC.EndpointB.MsgRecvPacketWithResult(packetBToC)
+	suite.Require().NoError(err)
+
+	// check that the receiver has received final tokens on chainC
+	traceBToC := types.NewHop(types.PortID, suite.pathBToC.EndpointB.ClientID)
+	chainCDenom := types.NewDenom(coin.Denom, traceBToC, traceAToB)
+	chainCBalance := suite.chainC.GetSimApp().BankKeeper.GetBalance(suite.chainC.GetContext(), suite.chainC.SenderAccount.GetAddress(), chainCDenom.IBCDenom())
+	coinSentFromBToC := sdk.NewCoin(chainCDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromBToC, chainCBalance)
+
+	// check that the final hop has written an acknowledgement
+	ack, err := ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	res, err = suite.pathBToC.EndpointA.MsgAcknowledgePacketWithResult(packetBToC, *ack)
+	suite.Require().NoError(err)
+
+	// check that the middle hop has now written its async acknowledgement
+	ack, err = ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	// update chainB client on chainA
+	err = suite.pathAToB.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	err = suite.pathAToB.EndpointA.MsgAcknowledgePacket(packetAToB, *ack)
+	suite.Require().NoError(err)
+}
+
+// TestFullEurekaForwardFailedAck ...
+func (suite *TransferTestSuite) TestFullEurekaForwardFailedAck() {
+	receiver := suite.chainC.SenderAccount.GetAddress().String()
+	hops := []types.Hop{{PortId: types.PortID, ChannelId: suite.pathBToC.EndpointA.ClientID}}
+
+	coin := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), sdk.DefaultBondDenom)
+	tokens := make([]types.Token, 1)
+	var err error
+	tokens[0], err = suite.chainA.GetSimApp().TransferKeeper.TokenFromCoin(suite.chainA.GetContext(), coin)
+	suite.Require().NoError(err)
+
+	timeoutTimestamp := uint64(suite.chainB.GetContext().BlockTime().Add(time.Hour).Unix())
+
+	transferData := types.FungibleTokenPacketDataV2{
+		Tokens:     tokens,
+		Sender:     suite.chainA.SenderAccount.GetAddress().String(),
+		Receiver:   receiver,
+		Memo:       "",
+		Forwarding: types.NewForwardingPacketData("", hops...),
+	}
+	bz := suite.chainA.Codec.MustMarshal(&transferData)
+	payload := channeltypesv2.NewPayload(
+		types.PortID, types.PortID, types.V2,
+		types.EncodingProtobuf, bz,
+	)
+	packetAToB, err := suite.pathAToB.EndpointA.MsgSendPacket(timeoutTimestamp, payload)
+	suite.Require().NoError(err)
+
+	// check the original sendPacket logic
+	escrowAddressA := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
+	chainABalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(sdkmath.ZeroInt(), chainABalance.Amount)
+	chainAEscrowBalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), escrowAddressA, coin.Denom)
+	suite.Require().Equal(coin, chainAEscrowBalance)
+
+	res, err := suite.pathAToB.EndpointB.MsgRecvPacketWithResult(packetAToB)
+	suite.Require().NoError(err)
+
+	escrowAddressB := types.GetEscrowAddress(types.PortID, suite.pathBToC.EndpointA.ClientID)
+	traceAToB := types.NewHop(types.PortID, suite.pathAToB.EndpointB.ClientID)
+	chainBDenom := types.NewDenom(coin.Denom, traceAToB)
+	chainBBalance := suite.chainB.GetSimApp().BankKeeper.GetBalance(suite.chainB.GetContext(), escrowAddressB, chainBDenom.IBCDenom())
+	coinSentFromAToB := sdk.NewCoin(chainBDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromAToB, chainBBalance)
+
+	packetBToC, err := ibctesting.ParsePacketV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	packetBToCCommitment := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketCommitment(suite.chainB.GetContext(), suite.pathBToC.EndpointA.ClientID, 1)
+	suite.Require().Equal(channeltypesv2.CommitPacket(packetBToC), packetBToCCommitment)
+
+	acknowledgementBToC := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketAcknowledgement(suite.chainB.GetContext(), suite.pathAToB.EndpointA.ClientID, 1)
+	suite.Require().Nil(acknowledgementBToC)
+
+	err = suite.pathBToC.EndpointB.UpdateClient()
+	suite.Require().NoError(err)
+
+	// turn off receive on chain C to trigger an error
+	suite.chainC.GetSimApp().TransferKeeper.SetParams(suite.chainC.GetContext(), types.Params{
+		SendEnabled:    true,
+		ReceiveEnabled: false,
+	})
+
+	res, err = suite.pathBToC.EndpointB.MsgRecvPacketWithResult(packetBToC)
+	suite.Require().NoError(err)
+
+	err = suite.pathBToC.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	ack, err := ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	res, err = suite.pathBToC.EndpointA.MsgAcknowledgePacketWithResult(packetBToC, *ack)
+	suite.Require().NoError(err)
+
+	ack, err = ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	err = suite.pathAToB.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	err = suite.pathAToB.EndpointA.MsgAcknowledgePacket(packetAToB, *ack)
+	suite.Require().NoError(err)
+
+	chainABalance = suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(coin, chainABalance)
+}
+
+// TestFullEurekaForwardTimeout ...
+func (suite *TransferTestSuite) TestFullEurekaForwardTimeout() {
+	receiver := suite.chainC.SenderAccount.GetAddress().String()
+	hops := []types.Hop{{PortId: types.PortID, ChannelId: suite.pathBToC.EndpointA.ClientID}}
+
+	coin := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), sdk.DefaultBondDenom)
+	tokens := make([]types.Token, 1)
+	var err error
+	tokens[0], err = suite.chainA.GetSimApp().TransferKeeper.TokenFromCoin(suite.chainA.GetContext(), coin)
+	suite.Require().NoError(err)
+
+	timeoutTimestamp := uint64(suite.chainB.GetContext().BlockTime().Add(time.Hour).Unix())
+
+	transferData := types.FungibleTokenPacketDataV2{
+		Tokens:     tokens,
+		Sender:     suite.chainA.SenderAccount.GetAddress().String(),
+		Receiver:   receiver,
+		Memo:       "",
+		Forwarding: types.NewForwardingPacketData("", hops...),
+	}
+	bz := suite.chainA.Codec.MustMarshal(&transferData)
+	payload := channeltypesv2.NewPayload(
+		types.PortID, types.PortID, types.V2,
+		types.EncodingProtobuf, bz,
+	)
+	packetAToB, err := suite.pathAToB.EndpointA.MsgSendPacket(timeoutTimestamp, payload)
+	suite.Require().NoError(err)
+
+	escrowAddressA := types.GetEscrowAddress(types.PortID, suite.pathAToB.EndpointA.ClientID)
+	chainABalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(sdkmath.ZeroInt(), chainABalance.Amount)
+	chainAEscrowBalance := suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), escrowAddressA, coin.Denom)
+	suite.Require().Equal(coin, chainAEscrowBalance)
+
+	res, err := suite.pathAToB.EndpointB.MsgRecvPacketWithResult(packetAToB)
+	suite.Require().NoError(err)
+
+	escrowAddressB := types.GetEscrowAddress(types.PortID, suite.pathBToC.EndpointA.ClientID)
+	traceAToB := types.NewHop(types.PortID, suite.pathAToB.EndpointB.ClientID)
+	chainBDenom := types.NewDenom(coin.Denom, traceAToB)
+	chainBBalance := suite.chainB.GetSimApp().BankKeeper.GetBalance(suite.chainB.GetContext(), escrowAddressB, chainBDenom.IBCDenom())
+	coinSentFromAToB := sdk.NewCoin(chainBDenom.IBCDenom(), coin.Amount)
+	suite.Require().Equal(coinSentFromAToB, chainBBalance)
+
+	packetBToC, err := ibctesting.ParsePacketV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	packetBToCCommitment := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketCommitment(suite.chainB.GetContext(), suite.pathBToC.EndpointA.ClientID, 1)
+	suite.Require().Equal(channeltypesv2.CommitPacket(packetBToC), packetBToCCommitment)
+
+	acknowledgementBToC := suite.chainB.GetSimApp().IBCKeeper.ChannelKeeperV2.GetPacketAcknowledgement(suite.chainB.GetContext(), suite.pathAToB.EndpointA.ClientID, 1)
+	suite.Require().Nil(acknowledgementBToC)
+
+	err = suite.pathBToC.EndpointB.UpdateClient()
+	suite.Require().NoError(err)
+
+	suite.coordinator.IncrementTimeBy(time.Hour * 5)
+	err = suite.pathBToC.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+
+	res, err = suite.pathBToC.EndpointA.MsgTimeoutPacketWithResult(packetBToC)
+	suite.Require().NoError(err)
+	ack, err := ibctesting.ParseAckV2FromEvents(res.Events)
+	suite.Require().NoError(err)
+
+	err = suite.pathAToB.EndpointA.UpdateClient()
+	suite.Require().NoError(err)
+	err = suite.pathAToB.EndpointA.MsgAcknowledgePacket(packetAToB, *ack)
+	suite.Require().NoError(err)
+
+	chainABalance = suite.chainA.GetSimApp().BankKeeper.GetBalance(suite.chainA.GetContext(), suite.chainA.SenderAccount.GetAddress(), coin.Denom)
+	suite.Require().Equal(coin, chainABalance)
+}
+
+// -----------------------------------------------------------------------------
+// SECTION: Additional keeper_test snippet
+// -----------------------------------------------------------------------------
+
+// KeeperTestSuite is a sample
+type KeeperTestSuite struct{}
+
+func (suite *KeeperTestSuite) SetupTest() {}
+func (suite *KeeperTestSuite) Run(name string, subtest func()) { subtest() }
+
+// We define a helper to assert upgrade errors, for demonstration
+func (suite *KeeperTestSuite) assertUpgradeError(actualError, expError error) {
+	if actualError == nil && expError == nil {
+		return
+	}
+	if actualError == nil && expError != nil {
+		panic(fmt.Sprintf("expected error %v but got nil", expError))
+	}
+	if expError == nil && actualError != nil {
+		panic(fmt.Sprintf("unexpected error %v", actualError))
+	}
+}
+
+// -----------------------------------------------------------------------------
+// SECTION: Big combined "main" block from your snippet
+// -----------------------------------------------------------------------------
+
+// This portion merges the “main” sample from your snippet, showing
+// an InterchainFiatBackedEngine with references to multiple blockchains.
+type InterchainFiatBackedEngine struct {
+	shortTermMemory        []string
+	longTermMemory         map[string]int
+	JKECounter             int
+	suspiciousTransactions []string
+	ATOMValue              float64
+}
+
+func NewInterchainFiatBackedEngine() *InterchainFiatBackedEngine {
+	return &InterchainFiatBackedEngine{
+		shortTermMemory:        make([]string, 0, 10),
+		longTermMemory:         make(map[string]int),
+		JKECounter:             0,
+		suspiciousTransactions: make([]string, 0),
+		ATOMValue:              5.89,
+	}
+}
+
+func cosmosSdkGetFullLedger() sdk.Ledger {
+	// fake stub
+	return sdk.Ledger{}
+}
+func (fde *InterchainFiatBackedEngine) checkLedgerIntegrity() {
+	cosmosLedger := cosmosSdkGetFullLedger()
+	ibcLedger := ibc.GetLedgerState()
+	bitcoinLedger := bitcore.GetFullLedger()
+	ethereumLedger := ethereum.GetFullLedger()
+
+	fde.checkFiatBackingConsistency(cosmosLedger, bitcoinLedger, ethereumLedger)
+	fde.detectFraud(cosmosLedger, ibcLedger, bitcoinLedger, ethereumLedger)
+}
+
+func (fde *InterchainFiatBackedEngine) checkFiatBackingConsistency(cosmosLedger sdk.Ledger, bitcoinLedger bitcore.Ledger, ethereumLedger ethereum.Ledger) {
+	btcValue := bitcore.GetReserveValue("btc_address_example")
+	ethValue := ethereum.GetReserveValue("eth_address_example")
+	fde.ATOMValue = (btcValue + ethValue) / 10000
+}
+
+func (fde *InterchainFiatBackedEngine) detectFraud(
+	cosmosLedger sdk.Ledger,
+	ibcLedger ibc.Ledger,
+	bitcoinLedger bitcore.Ledger,
+	ethereumLedger ethereum.Ledger,
+) {
+	ledgers := []interface{}{cosmosLedger, ibcLedger, bitcoinLedger, ethereumLedger}
+	for _, ledger := range ledgers {
+		switch l := ledger.(type) {
+		case sdk.Ledger:
+			for _, tx := range l.Transactions {
+				if fde.isSuspicious(tx) {
+					fde.suspiciousTransactions = append(fde.suspiciousTransactions, tx.ID)
+					fde.logSuspiciousTransaction(tx)
+				}
+			}
+		case ibc.Ledger:
+			for _, tx := range l.Transactions {
+				if fde.isIBCSuspicious(tx) {
+					fde.suspiciousTransactions = append(fde.suspiciousTransactions, tx.ID)
+					fde.logIBCSuspiciousTransaction(tx)
+				}
+			}
+		case bitcore.Ledger:
+			for _, tx := range l.Transactions {
+				if fde.isBitcoinSuspicious(tx) {
+					fde.suspiciousTransactions = append(fde.suspiciousTransactions, tx.ID)
+					fde.logBitcoinSuspiciousTransaction(tx)
+				}
+			}
+		case ethereum.Ledger:
+			for _, tx := range l.Transactions {
+				if fde.isEthereumSuspicious(tx) {
+					fde.suspiciousTransactions = append(fde.suspiciousTransactions, tx.ID)
+					fde.logEthereumSuspiciousTransaction(tx)
+				}
+			}
+		}
+	}
+}
+
+func (fde *InterchainFiatBackedEngine) isSuspicious(tx sdk.Tx) bool                 { return false }
+func (fde *InterchainFiatBackedEngine) isIBCSuspicious(tx ibc.IBCTx) bool          { return false }
+func (fde *InterchainFiatBackedEngine) isBitcoinSuspicious(tx bitcore.Transaction) bool {
+	return false
+}
+func (fde *InterchainFiatBackedEngine) isEthereumSuspicious(tx ethereum.Transaction) bool {
+	return false
+}
+
+func (fde *InterchainFiatBackedEngine) logSuspiciousTransaction(tx sdk.Tx) {
+	fmt.Printf("Suspicious Cosmos transaction detected: %s\n", tx.ID)
+}
+func (fde *InterchainFiatBackedEngine) logIBCSuspiciousTransaction(tx ibc.IBCTx) {
+	fmt.Printf("Suspicious IBC transaction detected: %s\n", tx.ID)
+}
+func (fde *InterchainFiatBackedEngine) logBitcoinSuspiciousTransaction(tx bitcore.Transaction) {
+	fmt.Printf("Suspicious Bitcoin transaction detected: %s\n", tx.ID)
+}
+func (fde *InterchainFiatBackedEngine) logEthereumSuspiciousTransaction(tx ethereum.Transaction) {
+	fmt.Printf("Suspicious Ethereum transaction detected: %s\n", tx.ID)
+}
+
+func cosmosSdkGetTransaction(txid string) interface{} {
+	return nil
+}
+func (fde *InterchainFiatBackedEngine) checkLedgerIntegrityForTransaction(txid, chain string) {
+	var tx interface{}
+	switch chain {
+	case "cosmos":
+		tx = cosmosSdkGetTransaction(txid)
+	case "bitcoin":
+		tx = bitcore.GetTransaction(txid)
+	case "ethereum":
+		tx = ethereum.GetTransaction(txid)
+	case "ibc":
+		tx = ibc.GetTransaction(txid)
+	}
+
+	switch t := tx.(type) {
+	case sdk.Tx:
+		if fde.isSuspicious(t) {
+			fde.suspiciousTransactions = append(fde.suspiciousTransactions, txid)
+			fde.logSuspiciousTransaction(t)
+		}
+	case ibc.IBCTx:
+		if fde.isIBCSuspicious(t) {
+			fde.suspiciousTransactions = append(fde.suspiciousTransactions, txid)
+			fde.logIBCSuspiciousTransaction(t)
+		}
+	case bitcore.Transaction:
+		if fde.isBitcoinSuspicious(t) {
+			fde.suspiciousTransactions = append(fde.suspiciousTransactions, txid)
+			fde.logBitcoinSuspiciousTransaction(t)
+		}
+	case ethereum.Transaction:
+		if fde.isEthereumSuspicious(t) {
+			fde.suspiciousTransactions = append(fde.suspiciousTransactions, txid)
+			fde.logEthereumSuspiciousTransaction(t)
+		}
+	}
+}
+
+func (fde *InterchainFiatBackedEngine) novelinput(input string) {
+	fde.manageMemory(input)
+	if strings.HasPrefix(input, "txid") {
+		fde.checkLedgerIntegrityForTransaction(input, "cosmos")
+	} else if strings.HasPrefix(input, "btc_txid") {
+		fde.checkLedgerIntegrityForTransaction(input, "bitcoin")
+	} else if strings.HasPrefix(input, "eth_txid") {
+		fde.checkLedgerIntegrityForTransaction(input, "ethereum")
+	} else if strings.HasPrefix(input, "ibc") {
+		fde.checkLedgerIntegrityForTransaction(input, "ibc")
+	}
+}
+
+func (fde *InterchainFiatBackedEngine) manageMemory(input string) {
+	if len(fde.shortTermMemory) >= 10 {
+		fde.shortTermMemory = fde.shortTermMemory[1:]
+	}
+	fde.shortTermMemory = append(fde.shortTermMemory, input)
+
+	if count, exists := fde.longTermMemory[input]; exists {
+		fde.longTermMemory[input] = count + 1
+	} else {
+		fde.longTermMemory[input] = 1
+	}
+}
+
+func (fde *InterchainFiatBackedEngine) processConversation(userInput string) string {
+	fde.novelinput(userInput)
+
+	for {
+		fde.updatePersistentState()
+		for _, item := range fde.shortTermMemory {
+			fde.analyzeContext(item)
+		}
+		fde.checkLedgerIntegrity()
+		time.Sleep(60 * time.Second)
+	}
+}
+
+func (fde *InterchainFiatBackedEngine) updatePersistentState() {}
+func (fde *InterchainFiatBackedEngine) analyzeContext(item string) {}
+
+func main() {
+	engine := NewInterchainFiatBackedEngine()
+	fmt.Println("Interchain Fiat Backed Engine running...")
+	fmt.Printf("Current ATOM Value: $%.2f\n", engine.ATOMValue)
+	engine.processConversation("")
+}
