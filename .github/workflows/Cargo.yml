@@ -17,7 +17,50 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      # 2) (Optional) install a particular Rust toolchain (stable, nightly, etc.)
+      # 2) Write Cargo.toml content from this YAML into an actual Cargo.toml file
+      - name: Write Cargo.toml
+        run: |
+          cat <<EOF > Cargo.toml
+          [package]
+          name = "pmll_logic_loop_knowledge_block"
+          version = "0.1.0"
+          edition = "2021"
+
+          # Author info; you can add more names or contact if needed.
+          authors = ["Josef Kurk Edwards (OpenAI) <josef@example.com>"]
+
+          description = "An example Rust project demonstrating cargo build"
+          license = "MIT"
+
+          [dependencies]
+          # Add your dependencies here, for example:
+          # serde = "1.0"
+          # rand = "0.8"
+
+          [package]
+          name = "pmll_logic_loop_knowledge_block"
+          version = "0.1.1"
+          edition = "2021"
+          license = "MIT"
+          authors = ["Josef Kurk Edwards (OpenAI) <josef@example.com>"]
+          description = "An upgraded Rust project demonstrating cargo build and common dependencies."
+
+          # Optional: if you're publishing to crates.io, you can also include:
+          # repository = "https://github.com/YOUR_USERNAME/YOUR_REPO"
+
+          [dependencies]
+          # Example commonly used crates:
+          serde = "1.0"
+          rand = "0.8"
+
+          # If you need additional crates, add them here (e.g. 'reqwest', 'tokio', etc.)
+
+          [profile.release]
+          # Example release build settings, if needed
+          opt-level = 3
+          EOF
+
+      # 3) (Optional) install a particular Rust toolchain (stable, nightly, etc.)
       #    The runner may already have stable Rust, so you can skip if you want default stable.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -28,97 +71,25 @@ jobs:
         #   toolchain: stable
         #   override: true
 
-      # 3) Build your Rust project
+      # 4) Build your Rust project
       - name: Cargo Build
         run: cargo build --verbose
         # If Cargo.toml is in a subdirectory, adjust with --manifest-path subdir/Cargo.toml
 
-      # 4) (Optional) Run tests
+      # 5) Run tests
       - name: Cargo Test
         run: cargo test --verbose
 
-      # 5) (Optional) Lint or format checks
-      # - name: Cargo Clippy
-      #   run: cargo clippy --all-targets --all-features -- -D warnings
+      # 6) (Optional) Run Clippy lint
+      - name: Cargo Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # - name: Cargo Fmt Check
-      #   run: cargo fmt --all -- --check
-[package]
-name = "pmll_logic_loop_knowledge_block"
-version = "0.1.0"
-edition = "2021"
+      # 7) (Optional) Setup Node.js environment
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v4.2.0
+        with:
+          # Provide a node-version if needed. Example: '16.x' or '18.x'
+          node-version: '16.x'
+          # Additional config can go here
 
-# Author info; you can add more names or contact if needed.
-authors = ["Josef Kurk Edwards (OpenAI) <josef@example.com>"]
-
-description = "An example Rust project demonstrating cargo build"
-license = "MIT"
-
-[dependencies]
-# Add your dependencies here, for example:
-# serde = "1.0"
-# rand = "0.8"
-
-[package]
-name = "pmll_logic_loop_knowledge_block"
-version = "0.1.1"
-edition = "2021"
-license = "MIT"
-authors = ["Josef Kurk Edwards (OpenAI) <josef@example.com>"]
-description = "An upgraded Rust project demonstrating cargo build and common dependencies."
-
-# Optional: if you're publishing to crates.io, you can also include:
-# repository = "https://github.com/YOUR_USERNAME/YOUR_REPO"
-
-[dependencies]
-# Example commonly used crates:
-serde = "1.0"
-rand = "0.8"
-
-# If you need additional crates, add them here (e.g. 'reqwest', 'tokio', etc.)
-
-[profile.release]
-# Example release build settings, if needed
-opt-level = 3
-
-name: "Cargo Build & Test"
-
-on:
-  # Run this workflow whenever a push is made to main
-  push:
-    branches: [ "main" ]
-  # Also run for pull requests targeting main
-  pull_request:
-    branches: [ "main" ]
-
-jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-
-    steps:
-      # 1. Check out your repository's code so we have access to Cargo.toml, src/, etc.
-      - name: Check out code
-        uses: actions/checkout@v4
-
-      # 2. (Optional) Install a particular Rust toolchain, e.g. stable, nightly, or a pinned version.
-      #    If you want the default stable from GitHub's runner, you can skip this step.
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        # Alternatively:
-        # uses: actions-rs/toolchain@v1
-        # with:
-        #   profile: minimal
-        #   toolchain: stable
-        #   override: true
-
-      # 3. Build your project in debug mode
-      - name: Cargo Build
-        run: cargo build --verbose
-
-      # 4. (Optional) Run tests
-      - name: Cargo Test
-        run: cargo test --verbose
-
-      # 5. (Optional) Run clippy or other checks
-      # - name: Cargo Clippy
-      #   run: cargo clippy --all-targets --all-features -- -D warnings
+          
